@@ -103,11 +103,12 @@ export default function DrawTool({ map }: Props) {
       medium: "#ffcc00",
       low: "#90ee90",
     };
-    const features = reports
+    const features: GeoJSON.Feature[] = reports
       .filter((r) => r.conflict_geojson)
       .map((r) => ({
         type: "Feature" as const,
-        geometry: r.conflict_geojson!,
+        // Cast: our GeoJSONGeometry is structurally compatible with GeoJSON.Geometry
+        geometry: r.conflict_geojson! as unknown as GeoJSON.Geometry,
         properties: { severity: r.severity, conflict_type: r.conflict_type },
       }));
     const geojson: GeoJSON.FeatureCollection = { type: "FeatureCollection", features };

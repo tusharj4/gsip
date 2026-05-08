@@ -30,10 +30,12 @@ export default function NLQueryBar({ map }: Props) {
       if (resp.data.geojson && resp.data.geojson.features.length > 0) {
         const srcId = "ai-query-result";
         const layerId = "ai-query-fill";
+        // Cast to GeoJSON.FeatureCollection — the API guarantees well-formed GeoJSON
+        const fc = resp.data.geojson as unknown as GeoJSON.FeatureCollection;
         if (map.getSource(srcId)) {
-          (map.getSource(srcId) as maplibregl.GeoJSONSource).setData(resp.data.geojson);
+          (map.getSource(srcId) as maplibregl.GeoJSONSource).setData(fc);
         } else {
-          map.addSource(srcId, { type: "geojson", data: resp.data.geojson });
+          map.addSource(srcId, { type: "geojson", data: fc });
           map.addLayer({
             id: layerId,
             type: "circle",

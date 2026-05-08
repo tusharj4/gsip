@@ -68,9 +68,16 @@ export interface NLQueryResponse {
   execution_ms: number;
 }
 
-// Minimal GeoJSON types (subset of the full spec)
+// GeoJSON geometry — use a discriminated union so it is compatible with
+// both @types/geojson and maplibre-gl's internal Geometry type.
+export type GeoJSONGeometryType =
+  | "Point" | "MultiPoint"
+  | "LineString" | "MultiLineString"
+  | "Polygon" | "MultiPolygon"
+  | "GeometryCollection";
+
 export interface GeoJSONGeometry {
-  type: string;
+  type: GeoJSONGeometryType;
   coordinates: unknown;
 }
 

@@ -5,7 +5,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 # ─── Development target ───────────────────────────────────────────────────────
 FROM base AS dev
 COPY package*.json ./
-RUN npm ci
+RUN npm install --legacy-peer-deps
 COPY . .
 EXPOSE 3000
 CMD ["npm", "run", "dev"]
@@ -13,7 +13,7 @@ CMD ["npm", "run", "dev"]
 # ─── Builder ──────────────────────────────────────────────────────────────────
 FROM base AS builder
 COPY package*.json ./
-RUN npm ci
+RUN npm install --legacy-peer-deps
 COPY . .
 RUN npm run build
 
