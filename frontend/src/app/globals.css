@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* MapLibre GL — reset map container styles */
+.maplibregl-map {
+  font-family: inherit;
+}
+
+/* Severity badge colours */
+.badge-blocker { @apply bg-red-500 text-white; }
+.badge-high    { @apply bg-orange-400 text-white; }
+.badge-medium  { @apply bg-yellow-400 text-gray-900; }
+.badge-low     { @apply bg-green-300 text-gray-900; }

@@ -1,0 +1,55 @@
+version: '3.9'
+
+# Production overrides — use with: docker compose -f docker-compose.yml -f docker-compose.prod.yml up
+
+services:
+  db:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  redis:
+    restart: always
+
+  minio:
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    restart: always
+
+  backend:
+    build:
+      context: ./backend
+      target: prod
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    environment:
+      ENABLE_AUTH: "true"
+    restart: always
+    volumes: []  # No volume mount in prod — use built image
+
+  frontend:
+    build:
+      context: ./frontend
+      target: prod
+    restart: always
+    volumes: []
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: always
+
+  grafana:
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    restart: always
