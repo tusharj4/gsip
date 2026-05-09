@@ -11,9 +11,11 @@ const nextConfig = {
     ];
   },
   webpack(config) {
+    // Use $ for exact-match alias so "maplibre-gl/dist/maplibre-gl.css"
+    // (and other subpath imports) are NOT affected by this alias.
     config.resolve.alias = {
       ...config.resolve.alias,
-      "maplibre-gl": "maplibre-gl/dist/maplibre-gl-dev.js",
+      "maplibre-gl$": "maplibre-gl/dist/maplibre-gl-dev.js",
     };
     return config;
   },

@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import maplibregl from "maplibre-gl";
-import "maplibre-gl/dist/maplibre-gl.css";
 import LayerPanel from "./LayerPanel";
 import InfoPanel from "./InfoPanel";
 import DrawTool from "./DrawTool";
