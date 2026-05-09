@@ -1,7 +1,14 @@
 """AI Natural Language to PostGIS Query Service.
 
-Uses Anthropic Claude API to translate plain English questions into
-read-only PostGIS SQL queries, executes them, and returns GeoJSON results.
+Uses Anthropic Claude API (async client) to translate plain English questions
+into read-only PostGIS SQL queries, executes them safely, and returns results
+as GeoJSON FeatureCollections when geometry is present.
+
+Security guarantees:
+- Only SELECT statements are executed
+- 10-second per-query statement timeout enforced at the DB level
+- Dangerous SQL keywords (DROP, DELETE, …) are blocked by regex
+- Raw DB errors are never surfaced to the caller
 """
 
 import json
@@ -35,25 +42,37 @@ Key spatial functions:
 - ST_Intersects(geom, other) — overlap check
 - ST_Buffer(geom::geography, meters)::geometry — buffer in meters
 - ST_Distance(geom::geography, other::geography) — distance in meters
-- ST_Area(geom::geography) — area in square meters
-- ST_AsGeoJSON(geom) — output as GeoJSON
+- ST_Area(geom::geography) — area in square metres
+- ST_AsGeoJSON(geom)::json — output as GeoJSON (the ::json cast is required)
 
 RULES:
 1. Always use ST_DWithin for distance queries (exploits GIST spatial index)
-2. Always cast to geography when distance/area must be in meters
+2. Always cast to geography when distance/area must be in metres
 3. Always add LIMIT 1000 unless the user specifies a different limit
 4. Return ONLY the SQL query — no explanation, no markdown fences, no comments
 5. NEVER use DROP, DELETE, UPDATE, INSERT, CREATE, ALTER, TRUNCATE — SELECT only
-6. When returning geometry, always include ST_AsGeoJSON(geom)::json as geometry column
-7. Use published layers: add WHERE gl.status = 'published' when querying layer_features via join"""
+6. When returning geometry, always include ST_AsGeoJSON(geom)::json AS geometry
+7. Only query published layers: WHERE gl.status = 'published' when joining layer_features"""
+
+# Compiled once at import time
+_DANGEROUS_KEYWORDS = re.compile(
+    r"\b(DROP|DELETE|UPDATE|INSERT|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|EXEC|EXECUTE)\b",
+    re.IGNORECASE,
+)
+_MARKDOWN_FENCE_START = re.compile(r"^```(?:sql)?\n?", re.IGNORECASE)
+_MARKDOWN_FENCE_END   = re.compile(r"\n?```$")
 
 
 class AIQueryService:
-    """Translates natural language to PostGIS SQL and executes it safely."""
+    """Translates natural language to PostGIS SQL and executes it safely.
+
+    Uses AsyncAnthropic so the Claude API call does not block the event loop.
+    """
 
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
-        self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        # AsyncAnthropic — non-blocking, compatible with asyncio event loop
+        self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     async def query(
         self,
@@ -68,6 +87,11 @@ class AIQueryService:
         rows, result_type, geojson = await self._execute_sql(sql)
         elapsed_ms = (time.perf_counter() - start) * 1000
 
+        logger.info(
+            "AI query completed in %.1fms | type=%s rows=%d | question=%r",
+            elapsed_ms, result_type, len(rows) if rows else 0, question[:80],
+        )
+
         return NLQueryResponse(
             question=question,
             sql=sql,
@@ -80,12 +104,12 @@ class AIQueryService:
         )
 
     async def _generate_sql(self, question: str, context: dict[str, Any] | None) -> str:
-        """Call Claude API to generate a SQL query for the given question."""
+        """Await the Claude API to generate a SQL query for the given question."""
         user_content = question
         if context:
             user_content += f"\n\nAdditional context: {json.dumps(context)}"
 
-        message = self._client.messages.create(
+        message = await self._client.messages.create(
             model=settings.anthropic_model,
             max_tokens=settings.anthropic_max_tokens,
             system=SYSTEM_PROMPT,
@@ -93,37 +117,34 @@ class AIQueryService:
         )
         sql = message.content[0].text.strip()
         # Strip markdown fences if Claude added them despite instructions
-        sql = re.sub(r"^```(?:sql)?\n?", "", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"\n?```$", "", sql)
+        sql = _MARKDOWN_FENCE_START.sub("", sql)
+        sql = _MARKDOWN_FENCE_END.sub("", sql)
         return sql.strip()
 
     @staticmethod
     def _validate_sql(sql: str) -> None:
-        """Reject any SQL that is not a plain SELECT statement.
+        """Reject anything that isn't a plain SELECT statement.
 
-        This is the security gate preventing writes or DDL execution.
+        This is the security gate preventing writes or DDL execution even if
+        Claude somehow generates them.
         """
         normalized = sql.strip().upper()
         if not normalized.startswith("SELECT"):
             raise ValueError("Only SELECT queries are permitted")
-        dangerous = re.compile(
-            r"\b(DROP|DELETE|UPDATE|INSERT|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|EXEC|EXECUTE)\b",
-            re.IGNORECASE,
-        )
-        if dangerous.search(sql):
+        if _DANGEROUS_KEYWORDS.search(sql):
             raise ValueError("Query contains disallowed SQL keywords")
 
     async def _execute_sql(
         self, sql: str
     ) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None]:
-        """Execute the validated SQL with a statement timeout.
+        """Execute the validated SQL with a per-statement timeout.
 
         Returns (rows, result_type, optional_geojson).
         result_type is one of: 'geojson' | 'table' | 'scalar'
         """
-        timeout_ms = settings.ai_sql_timeout_s * 1000
-        set_timeout = text(f"SET LOCAL statement_timeout = {timeout_ms}")
-        await self._db.execute(set_timeout)
+        timeout_ms = int(settings.ai_sql_timeout_s * 1000)
+        # SET LOCAL is session-scoped for the duration of this statement only
+        await self._db.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
 
         result = await self._db.execute(text(sql))
         columns = list(result.keys())
@@ -132,19 +153,17 @@ class AIQueryService:
         if not raw_rows:
             return [], "table", None
 
-        rows = [dict(zip(columns, row)) for row in raw_rows]
+        rows: list[dict[str, Any]] = [dict(zip(columns, row)) for row in raw_rows]
 
-        # Detect if any column contains GeoJSON geometry.
-        # asyncpg may return ST_AsGeoJSON()::json as a string or a dict depending
-        # on whether the json codec is registered — handle both.
-        geo_col = None
+        # Detect geometry column — asyncpg may return ST_AsGeoJSON()::json as
+        # either a string (text mode) or a dict (json codec mode). Handle both.
+        geo_col: str | None = None
         for col in columns:
             sample = rows[0].get(col)
             if isinstance(sample, str):
                 try:
                     parsed = json.loads(sample)
                     if isinstance(parsed, dict) and "type" in parsed:
-                        # Normalise all rows to dicts for this column
                         for row in rows:
                             raw = row.get(col)
                             if isinstance(raw, str):

@@ -12,6 +12,13 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.api.router import api_router
 
+# Prometheus metrics (optional — gracefully degraded if package missing)
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator as _Instrumentator
+    _PROMETHEUS_AVAILABLE = True
+except ImportError:
+    _PROMETHEUS_AVAILABLE = False
+
 logging.basicConfig(
     level=getattr(logging, settings.log_level),
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -83,3 +90,13 @@ async def readiness_check() -> dict[str, str]:
 
 # Mount versioned API router
 app.include_router(api_router, prefix="/api")
+
+# Prometheus metrics — exposes /metrics for Grafana/Prometheus scraping
+if _PROMETHEUS_AVAILABLE:
+    _Instrumentator(
+        should_group_status_codes=False,
+        should_ignore_untemplated=True,
+        should_respect_env_var=True,
+        env_var_name="ENABLE_METRICS",
+        excluded_handlers=["/health", "/ready", "/metrics"],
+    ).instrument(app).expose(app, include_in_schema=False, tags=["system"])

@@ -1,11 +1,20 @@
 """PDF Pre-Alignment Report Generator.
 
-Uses WeasyPrint (free, open-source) to generate PDF reports.
-Uses staticmap (wraps OSM tiles, no API key) for corridor map thumbnails.
+Uses WeasyPrint (free, open-source) to render HTML→PDF.
+Uses staticmap (OSM tiles, no API key) for corridor map thumbnails.
+Optionally caches generated PDFs to MinIO so re-downloads are instant.
+
+Both WeasyPrint and staticmap are synchronous/blocking — they are run in
+asyncio's default thread-pool executor via asyncio.to_thread() so they
+don't block the FastAPI event loop.
 """
 
+import asyncio
+import base64
+import io
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, text
@@ -15,6 +24,8 @@ from app.models.analysis import ConflictReport
 from app.models.project import Project
 
 logger = logging.getLogger(__name__)
+
+# ─── HTML template ────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -29,9 +40,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   td {{ padding: 6px 8px; border-bottom: 1px solid #ddd; font-size: 10pt; }}
   tr:nth-child(even) {{ background: #f5f8ff; }}
   .severity-blocker {{ background: #ff4d4d !important; color: white; font-weight: bold; }}
-  .severity-high {{ background: #ff9933 !important; color: white; }}
-  .severity-medium {{ background: #ffcc00 !important; }}
-  .severity-low {{ background: #90ee90 !important; }}
+  .severity-high    {{ background: #ff9933 !important; color: white; }}
+  .severity-medium  {{ background: #ffcc00 !important; }}
+  .severity-low     {{ background: #90ee90 !important; }}
   .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 9pt; font-weight: bold; }}
   .meta-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }}
   .meta-item {{ background: #f0f4ff; padding: 8px; border-radius: 4px; }}
@@ -69,19 +80,54 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
+# Regulatory clearances keyed by conflict_type slug
+CLEARANCE_MAP: dict[str, str] = {
+    "protected_forest":  "Forest Clearance (FC) — Forest Conservation Act 1980",
+    "wildlife_sanctuary": "Wildlife Clearance — Wildlife Protection Act 1972",
+    "national_park":     "Wildlife Clearance + Stage-I Forest Clearance",
+    "crz_zone_1":        "CRZ Clearance from MoEFCC — Coastal Regulation Zone Notification 2019",
+    "crz_zone_2":        "CRZ Clearance from State Coastal Zone Management Authority",
+    "crz_zone_3":        "CRZ NOC from District Authority",
+    "wetland_ramsar":    "Wetland Clearance — Wetlands (Conservation and Management) Rules 2017",
+    "eco_sensitive":     "Environmental Clearance (EC) — EIA Notification 2006",
+    "heritage_buffer":   "NOC from Archaeological Survey of India",
+    "river":             "NOC from Central Water Commission + State Irrigation Dept",
+    "water_body":        "NOC from Central Water Commission",
+    "mining_zone":       "Clearance from Ministry of Mines",
+}
+
+MINIO_BUCKET   = "gsip-reports"
+MINIO_KEY_FMT  = "reports/{project_id}/pre-alignment-report.pdf"
+
 
 class ReportGenerator:
-    """Generates PDF pre-alignment reports using WeasyPrint + staticmap."""
+    """Generates PDF pre-alignment reports using WeasyPrint + staticmap.
+
+    Heavy CPU/IO work (WeasyPrint rendering, staticmap tile fetching) runs
+    in asyncio.to_thread() to avoid blocking the FastAPI event loop.
+    """
 
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
 
     async def generate(self, project_id: uuid.UUID) -> bytes:
-        """Produce a complete PDF report for the given project.
+        """Produce a complete PDF for the project; try MinIO cache first.
 
-        Fetches: project metadata, conflict reports, gap analysis.
-        Renders a static map thumbnail if corridor geometry exists.
+        Steps:
+          1. Check MinIO for a cached PDF.
+          2. Fetch project + conflicts from DB.
+          3. Build corridor map thumbnail (staticmap, runs in thread).
+          4. Assemble HTML.
+          5. Render PDF (WeasyPrint, runs in thread).
+          6. Store PDF in MinIO for future requests.
         """
+        # 1. Try cache
+        cached = await self._fetch_cached(project_id)
+        if cached:
+            logger.info("Report cache hit for project %s", project_id)
+            return cached
+
+        # 2. Fetch data
         project = await self._db.get(Project, project_id)
         if not project:
             raise ValueError(f"Project {project_id} not found")
@@ -91,17 +137,15 @@ class ReportGenerator:
             .where(ConflictReport.project_id == project_id)
             .order_by(ConflictReport.severity)
         )
-        conflicts = conflicts_result.scalars().all()
+        conflicts: list[ConflictReport] = list(conflicts_result.scalars().all())
 
+        # 3. Build corridor map (async — fetches OSM tiles in thread pool)
         map_img_html = await self._build_map_html(project)
-        conflicts_table = self._build_conflict_table(conflicts)
-        clearances_html = self._build_clearances_html(conflicts)
 
-        from datetime import datetime, timezone
-
+        # 4. Assemble HTML
         html = HTML_TEMPLATE.format(
             name=project.name,
-            project_type=project.project_type or "N/A",
+            project_type=(project.project_type or "N/A").capitalize(),
             ministry=project.ministry or "N/A",
             status=project.status,
             buffer_m=project.buffer_m,
@@ -109,118 +153,157 @@ class ReportGenerator:
             project_id=str(project_id),
             conflict_count=len(conflicts),
             map_img_html=map_img_html,
-            conflicts_table=conflicts_table,
-            clearances_html=clearances_html,
+            conflicts_table=self._build_conflict_table(conflicts),
+            clearances_html=self._build_clearances_html(conflicts),
             generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         )
 
-        return self._render_pdf(html)
+        # 5. Render PDF in thread pool (WeasyPrint is synchronous + CPU-heavy)
+        pdf_bytes: bytes = await asyncio.to_thread(_render_pdf_sync, html)
+
+        # 6. Store in MinIO (best-effort — don't fail the request if MinIO is down)
+        await self._store_cached(project_id, pdf_bytes)
+
+        logger.info(
+            "Report generated for project %s: %d KB, %d conflicts",
+            project_id, len(pdf_bytes) // 1024, len(conflicts),
+        )
+        return pdf_bytes
+
+    # ─── Map thumbnail ────────────────────────────────────────────────────────
 
     async def _build_map_html(self, project: Project) -> str:
-        """Generate a static map thumbnail using staticmap (OSM tiles, no API key)."""
+        """Fetch OSM tiles and draw corridor line; runs in thread pool."""
         if project.corridor_geom is None:
             return "<p><em>No corridor geometry available for map thumbnail.</em></p>"
-
         try:
-            centroid_sql = text("""
-                SELECT
-                    ST_X(ST_Centroid(corridor_geom)) AS lon,
-                    ST_Y(ST_Centroid(corridor_geom)) AS lat
-                FROM projects WHERE id = :id
-            """)
-            result = await self._db.execute(centroid_sql, {"id": str(project.id)})
-            row = result.fetchone()
-            if not row:
-                return ""
-            lon, lat = row.lon, row.lat
+            # Query corridor as GeoJSON and centroid in one round-trip
+            row = (await self._db.execute(
+                text("""
+                    SELECT
+                        ST_AsGeoJSON(corridor_geom)::json AS geojson,
+                        ST_X(ST_Centroid(corridor_geom))  AS lon,
+                        ST_Y(ST_Centroid(corridor_geom))  AS lat
+                    FROM projects WHERE id = :id
+                """),
+                {"id": str(project.id)},
+            )).fetchone()
 
-            from staticmap import StaticMap, Line
-            from sqlalchemy import text as sql_text
+            if not row or not row.geojson:
+                return "<p><em>Map thumbnail unavailable.</em></p>"
 
-            # Get corridor as WKT to extract coordinates
-            wkt_sql = sql_text("SELECT ST_AsGeoJSON(corridor_geom)::json AS geojson FROM projects WHERE id = :id")
-            wkt_result = await self._db.execute(wkt_sql, {"id": str(project.id)})
-            wkt_row = wkt_result.fetchone()
-            if not wkt_row or not wkt_row.geojson:
-                return ""
+            coords: list[Any] = row.geojson.get("coordinates", [])
+            lon: float = row.lon
+            lat: float = row.lat
 
-            geojson = wkt_row.geojson
-            coords = geojson.get("coordinates", [])
-
-            m = StaticMap(800, 400)
-            if coords and len(coords) >= 2:
-                line = Line(coords, "blue", 3)
-                m.add_line(line)
-
-            image = m.render(zoom=8, center=[lon, lat])
-            import io
-            import base64
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode()
-            return f'<h2>Corridor Map</h2><img class="map" src="data:image/png;base64,{b64}" alt="Corridor Map"/>'
-
+            # Render in thread pool (staticmap fetches tiles synchronously)
+            b64 = await asyncio.to_thread(_render_map_thumbnail_sync, coords, lon, lat)
+            if not b64:
+                return "<p><em>Map thumbnail unavailable.</em></p>"
+            return (
+                '<h2>Corridor Map</h2>'
+                f'<img class="map" src="data:image/png;base64,{b64}" alt="Corridor Map"/>'
+            )
         except Exception as exc:
             logger.warning("Map thumbnail generation failed: %s", exc)
             return "<p><em>Map thumbnail unavailable.</em></p>"
 
+    # ─── HTML fragment builders ───────────────────────────────────────────────
+
     @staticmethod
     def _build_conflict_table(conflicts: list[ConflictReport]) -> str:
-        """Render an HTML table of conflict records sorted by severity."""
+        """Render an HTML table of conflicts sorted by severity."""
         if not conflicts:
-            return "<p>No conflicts detected for this corridor.</p>"
+            return "<p>✅ No conflicts detected for this corridor.</p>"
 
-        rows = ""
+        rows_html = ""
         for c in conflicts:
             sev_class = f"severity-{c.severity}" if c.severity else ""
-            area = f"{float(c.area_sqm):,.0f} m²" if c.area_sqm else "N/A"
-            rows += (
+            area_str  = f"{float(c.area_sqm):,.0f} m²" if c.area_sqm else "N/A"
+            rows_html += (
                 f"<tr>"
                 f"<td><span class='badge {sev_class}'>{(c.severity or '').upper()}</span></td>"
                 f"<td>{c.conflict_type or 'unknown'}</td>"
-                f"<td>{area}</td>"
+                f"<td>{area_str}</td>"
                 f"<td>{c.description or ''}</td>"
                 f"</tr>"
             )
-
-        return f"""
-        <table>
-          <thead><tr><th>Severity</th><th>Conflict Type</th><th>Area</th><th>Description</th></tr></thead>
-          <tbody>{rows}</tbody>
-        </table>"""
+        return (
+            "<table>"
+            "<thead><tr><th>Severity</th><th>Conflict Type</th><th>Area</th><th>Description</th></tr></thead>"
+            f"<tbody>{rows_html}</tbody>"
+            "</table>"
+        )
 
     @staticmethod
     def _build_clearances_html(conflicts: list[ConflictReport]) -> str:
         """Map detected conflict types to required regulatory clearances."""
-        clearance_map: dict[str, str] = {
-            "protected_forest": "Forest Clearance (FC) — Forest Conservation Act 1980",
-            "wildlife_sanctuary": "Wildlife Clearance — Wildlife Protection Act 1972",
-            "national_park": "Wildlife Clearance + Stage-I Forest Clearance",
-            "crz_zone_1": "CRZ Clearance from MoEFCC — Coastal Regulation Zone 2019",
-            "crz_zone_2": "CRZ Clearance from State Coastal Zone Management Authority",
-            "crz_zone_3": "CRZ NOC from District Authority",
-            "wetland_ramsar": "Wetland Clearance — Wetlands (Conservation and Management) Rules 2017",
-            "eco_sensitive": "Environmental Clearance (EC) — EIA Notification 2006",
-            "heritage_buffer": "NOC from Archaeological Survey of India",
-            "river": "NOC from Central Water Commission + State Irrigation Dept",
-        }
-
         conflict_types = {c.conflict_type for c in conflicts if c.conflict_type}
         required = [
-            f"<li>{clearance_map[ct]}</li>"
-            for ct in conflict_types
-            if ct in clearance_map
+            f"<li>{CLEARANCE_MAP[ct]}</li>"
+            for ct in sorted(conflict_types)
+            if ct in CLEARANCE_MAP
         ]
-
         if not required:
             return "<p>No specific regulatory clearances identified. Standard NOCs apply.</p>"
-
         return f"<ul>{''.join(required)}</ul>"
 
-    @staticmethod
-    def _render_pdf(html: str) -> bytes:
-        """Render HTML to PDF bytes using WeasyPrint."""
-        from weasyprint import HTML as WeasyHTML
+    # ─── MinIO caching ────────────────────────────────────────────────────────
 
-        doc = WeasyHTML(string=html)
-        return doc.write_pdf()
+    async def _fetch_cached(self, project_id: uuid.UUID) -> bytes | None:
+        """Try to retrieve a previously generated PDF from MinIO."""
+        try:
+            from app.services.minio_client import get_minio_client
+            client = get_minio_client()
+            key = MINIO_KEY_FMT.format(project_id=project_id)
+            # Run synchronous boto3 call in thread
+            obj = await asyncio.to_thread(
+                client.get_object, Bucket=MINIO_BUCKET, Key=key
+            )
+            return await asyncio.to_thread(obj["Body"].read)
+        except Exception:
+            return None
+
+    async def _store_cached(self, project_id: uuid.UUID, pdf_bytes: bytes) -> None:
+        """Store the generated PDF in MinIO (best-effort, never raises)."""
+        try:
+            from app.services.minio_client import get_minio_client
+            client = get_minio_client()
+            key = MINIO_KEY_FMT.format(project_id=project_id)
+            await asyncio.to_thread(
+                client.put_object,
+                Bucket=MINIO_BUCKET,
+                Key=key,
+                Body=pdf_bytes,
+                ContentType="application/pdf",
+            )
+        except Exception as exc:
+            logger.warning("MinIO cache store failed (non-fatal): %s", exc)
+
+
+# ─── Synchronous helpers (run in thread pool) ─────────────────────────────────
+
+def _render_pdf_sync(html: str) -> bytes:
+    """Render HTML to PDF bytes using WeasyPrint (synchronous, CPU-heavy)."""
+    from weasyprint import HTML as WeasyHTML  # type: ignore[import-untyped]
+    return WeasyHTML(string=html).write_pdf()
+
+
+def _render_map_thumbnail_sync(
+    coords: list[Any], lon: float, lat: float
+) -> str | None:
+    """Fetch OSM tiles and draw corridor; returns base64-encoded PNG or None."""
+    try:
+        from staticmap import StaticMap, Line  # type: ignore[import-untyped]
+
+        m = StaticMap(800, 400)
+        if coords and len(coords) >= 2:
+            m.add_line(Line(coords, "#1a3a6e", 3))
+
+        image = m.render(zoom=8, center=[lon, lat])
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception as exc:
+        logger.warning("staticmap render failed: %s", exc)
+        return None
