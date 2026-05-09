@@ -2,10 +2,11 @@
 
 from fastapi import APIRouter
 
-from app.api.v1 import layers, projects, analysis, routing, reports, ai
+from app.api.v1 import layers, projects, analysis, routing, reports, ai, auth
 
 api_router = APIRouter()
 
+api_router.include_router(auth.router, prefix="/v1/auth", tags=["auth"])
 api_router.include_router(layers.router, prefix="/v1/layers", tags=["layers"])
 api_router.include_router(projects.router, prefix="/v1/projects", tags=["projects"])
 api_router.include_router(analysis.router, prefix="/v1/analysis", tags=["analysis"])

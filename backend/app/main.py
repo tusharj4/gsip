@@ -12,6 +12,15 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.api.router import api_router
 
+# Rate limiting (slowapi — Redis-backed, gracefully degraded if unavailable)
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+    _SLOWAPI_AVAILABLE = True
+except ImportError:
+    _SLOWAPI_AVAILABLE = False
+
 # Prometheus metrics (optional — gracefully degraded if package missing)
 try:
     from prometheus_fastapi_instrumentator import Instrumentator as _Instrumentator
@@ -29,10 +38,25 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup and shutdown lifecycle hooks."""
-    logger.info("GSIP backend starting up — env=%s", settings.app_env)
+    logger.info(
+        "GSIP backend starting up — env=%s auth=%s rate_limit=%s",
+        settings.app_env,
+        settings.enable_auth,
+        settings.enable_rate_limit,
+    )
     yield
     logger.info("GSIP backend shutting down")
 
+
+# Build the global rate limiter (no-op if slowapi not installed or rate limiting disabled)
+if _SLOWAPI_AVAILABLE and settings.enable_rate_limit:
+    _limiter = Limiter(
+        key_func=get_remote_address,
+        storage_uri=settings.redis_url,
+        default_limits=[],  # only apply limits where decorated
+    )
+else:
+    _limiter = None  # type: ignore[assignment]
 
 app = FastAPI(
     title="GatiShakti Intelligence Platform API",
@@ -46,6 +70,11 @@ app = FastAPI(
     openapi_url="/openapi.json",
     lifespan=lifespan,
 )
+
+# Attach the limiter to app state so @limiter.limit() can find it
+if _limiter is not None:
+    app.state.limiter = _limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 
 # CORS — allow frontend dev server and any configured origins
 app.add_middleware(

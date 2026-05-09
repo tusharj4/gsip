@@ -45,12 +45,13 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
+    supabase_jwt_secret: str = ""  # Settings → API → JWT Settings → JWT Secret
 
     # Feature flags
     enable_ai_query: bool = True
     enable_auth: bool = False
-    enable_rate_limit: bool = False
-    ai_query_rate_limit: int = 10
+    enable_rate_limit: bool = True
+    ai_query_rate_limit: int = 10  # requests per minute per IP
 
     @property
     def is_production(self) -> bool:
