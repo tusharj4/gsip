@@ -92,7 +92,7 @@ async def seed(db: AsyncSession) -> None:
         await db.execute(
             text("""
                 INSERT INTO gis_layers (name, slug, category, ministry_owner, status)
-                VALUES (:name, :slug, :category, :ministry_owner, 'draft')
+                VALUES (:name, :slug, :category, :ministry_owner, 'published')
                 ON CONFLICT (slug) DO NOTHING
             """),
             layer,
